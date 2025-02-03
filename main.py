@@ -1,5 +1,5 @@
+import random
 from sanic import Sanic, json
-from sanic.response import JSONResponse
 import httpx
 import os
 from dotenv import load_dotenv
@@ -9,8 +9,8 @@ import asyncio
 import json as json_lib
 from datetime import datetime
 import time
+import structlog
 
-# Configure structlog
 logger = structlog.get_logger()
 app = Sanic("ElevationAPI")
 app.config.REQUEST_TIMEOUT = 3000
@@ -29,28 +29,54 @@ class APIKeyManager:
         ]
         self.current_index = 0
         self.lock = asyncio.Lock()
-        self.request_counts = {key: 0 for key in self.api_keys}
+        self.request_counts = {
+            key: 0 for key in self.api_keys if key
+        }  # Only count valid keys
         self.last_reset = time.time()
+        self.requests_per_minute = 6000  # Google Maps API limit per key
+
+        # Log initial setup
+        logger.info(f"Initialized APIKeyManager with {len(self.api_keys)} keys")
 
     async def get_next_key(self):
         async with self.lock:
-            # Reset counters if a minute has passed
             current_time = time.time()
+
+            # Reset counters if a minute has passed
             if current_time - self.last_reset >= 60:
-                self.request_counts = {key: 0 for key in self.api_keys}
+                logger.info("Resetting request counts for all keys")
+                self.request_counts = {key: 0 for key in self.api_keys if key}
                 self.last_reset = current_time
 
-            # Get next available key
+            # Try each key in rotation until finding one under the limit
             for _ in range(len(self.api_keys)):
                 key = self.api_keys[self.current_index]
-                if self.request_counts[key] < 6000:  # 6000 requests per minute limit
+                if key and self.request_counts[key] < self.requests_per_minute:
                     self.request_counts[key] += 1
+
+                    # Rotate to next key for next request
                     self.current_index = (self.current_index + 1) % len(self.api_keys)
                     return key
+
+                # Move to next key if current one is at limit
                 self.current_index = (self.current_index + 1) % len(self.api_keys)
 
-            # If all keys are at limit, wait and try again
-            await asyncio.sleep(1)
+            # If all keys are at limit, calculate wait time
+            time_since_reset = current_time - self.last_reset
+            time_to_wait = max(0, 60 - time_since_reset)
+
+            if time_to_wait > 0:
+                logger.warning(
+                    f"All keys at limit. Waiting {time_to_wait:.2f} seconds for reset"
+                )
+                await asyncio.sleep(time_to_wait)
+                self.last_reset = time.time()
+                self.request_counts = {key: 0 for key in self.api_keys if key}
+                return await self.get_next_key()
+
+            # If we shouldn't wait, just reset and try again
+            self.last_reset = current_time
+            self.request_counts = {key: 0 for key in self.api_keys if key}
             return await self.get_next_key()
 
 
@@ -68,15 +94,13 @@ def save_to_json(data, lat, lng, area):
     return filepath
 
 
-def generate_grid_points(center_lat, center_lng, area_km2, step_m=15):
-    """Generate points in a square grid"""
+def generate_denser_grid(center_lat, center_lng, area_km2, step_m=5):
     side_length_m = math.sqrt(area_km2) * 1000
     points_per_side = int(side_length_m / step_m) + 1
     start_lat = center_lat + (side_length_m / 2 / 111111)
     start_lng = center_lng - (
         side_length_m / 2 / (111111 * math.cos(math.radians(center_lat)))
     )
-
     points = []
     for i in range(points_per_side):
         for j in range(points_per_side):
@@ -89,83 +113,70 @@ def generate_grid_points(center_lat, center_lng, area_km2, step_m=15):
 
 
 async def process_batch(
-    client, batch, batch_num, total_batches, key_manager, max_retries=3
+    client, batch, batch_num, total_batches, key_manager, max_retries=5
 ):
-    """Process a single batch with enhanced error handling"""
-    for retry in range(max_retries):
+    for attempt in range(max_retries):
         try:
             api_key = await key_manager.get_next_key()
-
-            # Format locations properly
             locations_str = "|".join(f"{lat:.7f},{lng:.7f}" for lat, lng in batch)
             url = "https://maps.googleapis.com/maps/api/elevation/json"
             params = {"locations": locations_str, "key": api_key}
-
             headers = {
                 "Accept": "application/json",
                 "User-Agent": "elevation-api-client",
             }
-
             response = await client.get(
                 url, params=params, headers=headers, timeout=30.0
             )
 
-            if response.status_code != 200:
-                logger.error(f"HTTP Error {response.status_code}: {response.text}")
-                await asyncio.sleep(1)
-                continue
-
-            data = response.json()
-
-            if data.get("status") == "OK" and data.get("results"):
-                results = []
-                for idx, result in enumerate(data["results"]):
-                    point_lat, point_lng = batch[idx]
-                    results.append(
-                        {
-                            "location": {
-                                "lat": point_lat,
-                                "lng": point_lng,
-                            },
-                            "elevation": result["elevation"],
-                            "resolution": result.get("resolution", 0),
-                        }
+            if response.status_code == 200:
+                data = response.json()
+                if data.get("status") == "OK" and data.get("results"):
+                    results = []
+                    for idx, result in enumerate(data["results"]):
+                        point_lat, point_lng = batch[idx]
+                        results.append(
+                            {
+                                "location": {
+                                    "lat": point_lat,
+                                    "lng": point_lng,
+                                },
+                                "elevation": result["elevation"],
+                                "resolution": result.get("resolution", 0),
+                            }
+                        )
+                    logger.info(f"Processed batch: {batch_num}/{total_batches}")
+                    return results
+                else:
+                    logger.error(
+                        f"API Error: {data.get('status')} - {data.get('error_message', 'No error message')}"
                     )
-                logger.info(f"Processed batch: {batch_num}/{total_batches}")
-                return results
+            else:
+                logger.error(f"HTTP Error {response.status_code}: {response.text}")
+
+            if attempt < max_retries - 1:
+                # Exponential backoff
+                delay = (2**attempt) + random.uniform(0, 1)
+                logger.warning(
+                    f"Attempt {attempt + 1} failed. Retrying in {delay:.2f} seconds..."
+                )
+                await asyncio.sleep(delay)
             else:
                 logger.error(
-                    f"API Error: {data.get('status')} - {data.get('error_message', 'No error message')}"
+                    f"Max retries ({max_retries}) reached after {attempt + 1} attempts."
                 )
-                if data.get("status") == "OVER_QUERY_LIMIT":
-                    await asyncio.sleep(2)
-                continue
-
+                raise Exception("Max retries exceeded")
         except Exception as e:
             logger.error(f"Error processing batch {batch_num}: {str(e)}")
-            await asyncio.sleep(1)
-            continue
-    return []
-
-
-async def process_batches_with_rate_limit(client, batches, key_manager):
-    """Process batches with optimized rate limiting"""
-    concurrent_requests = len(key_manager.api_keys) * 50
-    results = []
-
-    for i in range(0, len(batches), concurrent_requests):
-        current_batches = batches[i : i + concurrent_requests]
-        tasks = [
-            process_batch(client, batch, i + j + 1, len(batches), key_manager)
-            for j, batch in enumerate(current_batches)
-        ]
-        batch_results = await asyncio.gather(*tasks)
-        results.extend(batch_results)
-
-        if i + concurrent_requests < len(batches):
-            await asyncio.sleep(1)
-
-    return results
+            if attempt < max_retries - 1:
+                # Exponential backoff
+                delay = (2**attempt) + random.uniform(0, 1)
+                logger.warning(
+                    f"Attempt {attempt + 1} failed. Retrying in {delay:.2f} seconds..."
+                )
+                await asyncio.sleep(delay)
+            else:
+                raise
 
 
 @app.get("/elevation-grid/<lat:float>/<lng:float>/<area:float>")
@@ -178,26 +189,26 @@ async def get_elevation_grid(request, lat: float, lng: float, area: float):
         if not (-90 <= lat <= 90 and -180 <= lng <= 180):
             return json({"error": "Invalid coordinates"}, status=400)
 
-        points = generate_grid_points(lat, lng, area, step_m=15)
+        points = generate_denser_grid(lat, lng, area, step_m=5)
         total_points = len(points)
-
-        batch_size = 250
+        logger.info(f"Generated {total_points} points for {area} km2 area")
+        # Larger batch size for speed
+        batch_size = 400  # Close to Google's limit of 512
         batches = [
             points[i : i + batch_size] for i in range(0, len(points), batch_size)
         ]
-
         start_time = time.time()
-
         async with httpx.AsyncClient(
             timeout=60.0,
-            limits=httpx.Limits(max_keepalive_connections=40, max_connections=40),
+            limits=httpx.Limits(max_keepalive_connections=100, max_connections=100),
+            http2=True,  # Enable HTTP/2 for better performance
         ) as client:
-            all_results = await process_batches_with_rate_limit(
-                client, batches, key_manager
-            )
-
-        end_time = time.time()
-        processing_time = end_time - start_time
+            # Process all batches concurrently
+            tasks = [
+                process_batch(client, batch, i + 1, len(batches), key_manager)
+                for i, batch in enumerate(batches)
+            ]
+            all_results = await asyncio.gather(*tasks)
 
         elevations = []
         for batch_result in all_results:
@@ -207,8 +218,10 @@ async def get_elevation_grid(request, lat: float, lng: float, area: float):
         if not elevations:
             return json({"error": "Failed to get elevation data"}, status=500)
 
+        end_time = time.time()
+        processing_time = end_time - start_time
         response_data = {
-            "processing_time_seconds": processing_time,
+            "processing_time": processing_time,
             "center": {"lat": lat, "lng": lng},
             "area_km2": area,
             "step_m": 15,
@@ -217,18 +230,10 @@ async def get_elevation_grid(request, lat: float, lng: float, area: float):
             "timestamp": datetime.now().isoformat(),
             "successful_points": len(elevations),
             "failed_points": total_points - len(elevations),
-            "performance_metrics": {
-                "points_per_second": (
-                    len(elevations) / processing_time if processing_time > 0 else 0
-                ),
-                "total_batches": len(batches),
-                "concurrent_requests": len(key_manager.api_keys) * 25,
-            },
         }
 
         filepath = save_to_json(response_data, lat, lng, area)
         response_data["file_saved"] = filepath
-
         return json(response_data)
 
     except Exception as e:
