@@ -1,0 +1,3 @@
+*.env
+elevation_data/
+__pycache__

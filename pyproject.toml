@@ -1,0 +1,23 @@
+[tool.poetry]
+name = "python-be"
+package-mode = false
+version = "0.1.0"
+description = ""
+authors = ["nitine <nitin.spaced@gmail.com>"]
+readme = "README.md"
+
+
+[tool.poetry.dependencies]
+python = "^3.11"
+fastapi = "^0.115.8"
+httpx = "^0.28.1"
+python-dotenv = "^1.0.1"
+sanic = "^24.12.0"
+sanic-cors = "^2.2.0"
+numpy = "^2.2.2"
+structlog = "^25.1.0"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
