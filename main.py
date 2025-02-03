@@ -1,4 +1,5 @@
 import random
+from pydantic import BaseModel, Field, validator
 from sanic import Sanic, json
 import httpx
 import os
@@ -19,6 +20,14 @@ app.config.KEEP_ALIVE_TIMEOUT = 3000
 
 # Load environment variables
 load_dotenv()
+
+
+class ElevationRequest(BaseModel):
+    lat: float = Field(..., ge=-90, le=90, description="Latitude between -90 and 90")
+    lng: float = Field(
+        ..., ge=-180, le=180, description="Longitude between -180 and 180"
+    )
+    area: float = Field(..., gt=0, description="Area in square kilometers")
 
 
 class APIKeyManager:
@@ -224,7 +233,81 @@ async def get_elevation_grid(request, lat: float, lng: float, area: float):
             "processing_time": processing_time,
             "center": {"lat": lat, "lng": lng},
             "area_km2": area,
-            "step_m": 15,
+            "points_count": len(elevations),
+            "points": elevations,
+            "timestamp": datetime.now().isoformat(),
+            "successful_points": len(elevations),
+            "failed_points": total_points - len(elevations),
+        }
+
+        filepath = save_to_json(response_data, lat, lng, area)
+        response_data["file_saved"] = filepath
+        return json(response_data)
+
+    except Exception as e:
+        logger.exception("server_error", error=str(e))
+        return json({"error": "Server error", "details": str(e)}, status=500)
+
+
+@app.post("/elevation")
+async def post_elevation_grid(request):
+    try:
+        try:
+            data = request.json
+            elevation_request = ElevationRequest(**data)
+        except ValueError as e:
+            return {
+                "status": "error",
+                "code": 400,
+                "message": "Invalid request data",
+                "details": str(e),
+            }
+
+        lat = elevation_request.lat
+        lng = elevation_request.lng
+        area = elevation_request.area
+        key_manager = APIKeyManager()
+        if not any(key_manager.api_keys):
+            return json({"error": "No API keys configured"}, status=500)
+
+        if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+            return json({"error": "Invalid coordinates"}, status=400)
+
+        points = generate_denser_grid(lat, lng, area, step_m=5)
+        total_points = len(points)
+        logger.info(f"Generated {total_points} points for {area} km2 area")
+        # Larger batch size for speed
+        batch_size = 400  # Close to Google's limit of 512
+        batches = [
+            points[i : i + batch_size] for i in range(0, len(points), batch_size)
+        ]
+        start_time = time.time()
+        async with httpx.AsyncClient(
+            timeout=60.0,
+            limits=httpx.Limits(max_keepalive_connections=100, max_connections=100),
+            http2=True,  # Enable HTTP/2 for better performance
+        ) as client:
+            # Process all batches concurrently
+            tasks = [
+                process_batch(client, batch, i + 1, len(batches), key_manager)
+                for i, batch in enumerate(batches)
+            ]
+            all_results = await asyncio.gather(*tasks)
+
+        elevations = []
+        for batch_result in all_results:
+            if batch_result:
+                elevations.extend(batch_result)
+
+        if not elevations:
+            return json({"error": "Failed to get elevation data"}, status=500)
+
+        end_time = time.time()
+        processing_time = end_time - start_time
+        response_data = {
+            "processing_time": processing_time,
+            "center": {"lat": lat, "lng": lng},
+            "area_km2": area,
             "points_count": len(elevations),
             "points": elevations,
             "timestamp": datetime.now().isoformat(),
