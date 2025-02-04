@@ -1,6 +1,6 @@
 import random
 from pydantic import BaseModel, Field, validator
-from sanic import Sanic, json
+from sanic import HTTPResponse, Sanic, json
 import httpx
 import os
 from dotenv import load_dotenv
@@ -10,7 +10,6 @@ import asyncio
 import json as json_lib
 from datetime import datetime
 import time
-import structlog
 
 logger = structlog.get_logger()
 app = Sanic("ElevationAPI")
@@ -188,6 +187,25 @@ async def process_batch(
                 raise
 
 
+@app.middleware("response")
+async def add_cors_headers(request, response):
+    # Check if the response is an HTTPResponse (including error responses)
+    if isinstance(response, HTTPResponse):
+        # Add CORS headers to every response
+        response.headers.update(
+            {
+                "Access-Control-Allow-Origin": "*",  # Configure this based on your needs
+                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+                "Access-Control-Allow-Headers": (
+                    "origin, content-type, accept, "
+                    "authorization, x-xsrf-token, x-request-id"
+                ),
+                "Access-Control-Allow-Credentials": "true",
+            }
+        )
+    return response
+
+
 @app.get("/elevation-grid/<lat:float>/<lng:float>/<area:float>")
 async def get_elevation_grid(request, lat: float, lng: float, area: float):
     try:
@@ -241,7 +259,6 @@ async def get_elevation_grid(request, lat: float, lng: float, area: float):
         }
 
         filepath = save_to_json(response_data, lat, lng, area)
-        response_data["file_saved"] = filepath
         return json(response_data)
 
     except Exception as e:
@@ -249,8 +266,19 @@ async def get_elevation_grid(request, lat: float, lng: float, area: float):
         return json({"error": "Server error", "details": str(e)}, status=500)
 
 
-@app.post("/elevation")
+@app.route("/elevation", methods=["POST", "OPTIONS"])
 async def post_elevation_grid(request):
+    # Handle OPTIONS request for CORS preflight
+    if request.method == "OPTIONS":
+        return json(
+            {"status": "ok"},
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "POST, OPTIONS",
+                "Access-Control-Allow-Headers": "Content-Type, Authorization",
+                "Access-Control-Max-Age": "86400",  # 24 hours
+            },
+        )
     try:
         try:
             data = request.json
