@@ -341,10 +341,11 @@ async def post_elevation_grid(request):
             "timestamp": datetime.now().isoformat(),
             "successful_points": len(elevations),
             "failed_points": total_points - len(elevations),
+            "step_m": 5,
         }
 
-        filepath = save_to_json(response_data, lat, lng, area)
-        response_data["file_saved"] = filepath
+        # filepath = save_to_json(response_data, lat, lng, area)
+        # response_data["file_saved"] = filepath
         return json(response_data)
 
     except Exception as e:
